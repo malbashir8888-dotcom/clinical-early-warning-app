@@ -963,7 +963,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
 
     st.set_page_config(page_title="Early Warning System", layout="wide")
     st.title("نظام الإنذار المبكر  |  Early Warning System")
-    # Removed (as requested): explanatory caption about XAI methods
+    st.caption("التفسير: Attention (Weak-XAI) + Integrated Gradients / GradientShap (Captum) بدون إعادة تدريب.")
 
     d = np.load(prepared_npz, allow_pickle=True)
     V, M, L, y = d["V"], d["M"], d["L"], d["y"]
@@ -1048,13 +1048,13 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
     c3.metric("Label", int(y[idx]))
     c4.metric("Time length", int(L[idx]))
 
-    # Attention
-    st.subheader("Attention over time")  # Removed "Weak-XAI"
+    # Weak-XAI Attention
+    st.subheader("Weak-XAI: Attention over time")
     fig_att = _plot_line(alpha, "Attention over time", "Time step", "Attention")
     st.pyplot(fig_att)
 
-    # Top time step by attention + top observed features at that time
-    st.subheader("Top time step + top observed features")  # Removed "Weak-XAI" phrasing
+    # Weak-XAI Top time step by attention + top observed features at that time
+    st.subheader("Weak-XAI: Top time step (attention) + top observed features at that time")
     t_star_att = int(np.argmax(alpha))
     obs_att = M[idx, t_star_att] > 0.5
     vals_att = V[idx, t_star_att]
@@ -1076,8 +1076,8 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
     st.dataframe(pd.DataFrame(rows_att), use_container_width=True)
 
     # Attribution explanations
-    st.subheader("Explanation")  # Simplified title
-    # Removed (as requested): caption explaining what will appear after Explain
+    st.subheader("Attribution-based explanation (IG / GradientShap)")
+    st.caption("بعد الضغط على Explain سيتم عرض: Heatmap + Top features (مجمّع عبر الزمن) + Top time step + Top features at that time + Similar patients + Exports.")
 
     exp = None
     if mode == "Saved case":
@@ -1092,7 +1092,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
                     exp = explain_gradshap(model, V, M, L, idx=idx, n_samples=50, stdevs=0.01, topk=topk)
 
     if exp is None or "attr_full" not in exp:
-        st.info("اضغط Explain لعرض النتائج.")
+        st.info("اضغط Explain لعرض Heatmap + Top features + Similar patients.")
     else:
         Tlen = int(L[idx])
         attr_full = exp["attr_full"][:Tlen]  # [T,F]
@@ -1114,7 +1114,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
             })
 
         st.markdown(f"**Method:** {exp.get('method', explain_method)}")
-        st.markdown(f"**Top time step:** {t_star}")
+        st.markdown(f"**Top time step (by attribution):** {t_star}")
 
         colx1, colx2 = st.columns(2)
         with colx1:
@@ -1147,16 +1147,20 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
         st.markdown("### Heatmap (Time × Features)")
         topk_feat = top_feat
         mat = attr_full[:, topk_feat]  # [T,K]
+        xt = []
+        for fi in topk_feat:
+            _, en, _ = _feat_lookup(fmap, int(fi))
+            xt.append(en)
         fig_hm = _plot_heatmap(mat, "Attribution Heatmap (Time x Top Features)", "Top features", "Time step", xticklabels=None)
         st.pyplot(fig_hm)
 
         # Temporal importance plot
-        st.markdown("### Temporal importance")
+        st.markdown("### Top timestep + temporal importance")
         fig_time = _plot_line(time_imp, "Temporal importance (sum abs attr)", "Time step", "Importance")
         st.pyplot(fig_time)
 
         # Similar patients (no training)
-        st.markdown("### Similar patients")
+        st.markdown("### Compare with similar patients (no retraining)")
         with st.spinner("Finding similar patients..."):
             b = all_emb[idx]  # [H]
             sims = _cosine_sim_matrix(all_emb, b)  # [N]
@@ -1196,6 +1200,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
             "top_features_agg": rows_agg,
             "top_features_at_time": rows_time,
             "similar_patients": rows_sim,
+            # store heatmap only (top features) to keep JSON smaller
             "attr_topk_heatmap": mat.tolist(),
             "top_feat_idx": [int(x) for x in topk_feat.tolist()],
         }
@@ -1219,6 +1224,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
             st.success(f"Saved: {out_xlsx}")
 
         if cexp4.button("Export PDF report"):
+            # Save figures to temporary images then insert into PDF
             tmpdir = Path(tempfile.mkdtemp())
             hm_png = tmpdir / "heatmap.png"
             time_png = tmpdir / "temporal.png"
