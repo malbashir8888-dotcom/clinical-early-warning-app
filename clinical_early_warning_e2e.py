@@ -1,4 +1,3 @@
-%%writefile /content/clinical_early_warning_e2e.py
 # clinical_early_warning_e2e.py (single-file)
 # End-to-end: Zenodo -> Inspect -> Prepare -> Train -> UI (Streamlit)
 # UI upgrades: Heatmap + Top features + Top timestep + Similar patients (no retraining)
