@@ -1,9 +1,9 @@
 # clinical_early_warning_e2e.py (single-file)
 # End-to-end: Zenodo -> Inspect -> Prepare -> Train -> UI (Streamlit)
-# UI upgrades: Heatmap + Top features + Top timestep + Similar patients (no retraining)
-# Exports: CSV + Excel (multi-sheet) + PDF report (with plots)
+# UI: Captum explanations only (Integrated Gradients / GradientShap) — no retraining
+# After Explain: Heatmap + Top features (agg) + Top time step + Top features at that time + Similar patients + Exports
 
-import sys, os, json, argparse, gzip, time, math, tempfile
+import sys, os, json, argparse, gzip, time, math, tempfile, io
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 
@@ -550,7 +550,6 @@ class GRUAttnClassifier(nn.Module):
         return logit, alpha
 
     def encode_context(self, V, M, L):
-        """Return context vector (attention-weighted) for similarity search. No training needed."""
         x = torch.cat([V, M], dim=-1)
         packed = nn.utils.rnn.pack_padded_sequence(x, L.cpu(), batch_first=True, enforce_sorted=False)
         h_packed, _ = self.gru(packed)
@@ -759,7 +758,7 @@ def list_cases(cases_dir: Path) -> List[Path]:
 def load_case(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
-def export_case_csv(out_path: Path, case: Dict[str, Any]) -> Path:
+def _case_csv_bytes(case: Dict[str, Any]) -> bytes:
     rows = []
     core = {
         "case_id": case.get("case_id"),
@@ -774,13 +773,11 @@ def export_case_csv(out_path: Path, case: Dict[str, Any]) -> Path:
     for k, v in core.items():
         rows.append((k, v))
     df = pd.DataFrame(rows, columns=["key", "value"])
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(out_path, index=False)
-    return out_path
+    return df.to_csv(index=False).encode("utf-8")
 
-def export_case_excel(out_path: Path, case: Dict[str, Any]) -> Path:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with pd.ExcelWriter(out_path, engine="openpyxl") as w:
+def _case_excel_bytes(case: Dict[str, Any]) -> bytes:
+    bio = io.BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as w:
         summary = pd.DataFrame([{
             "case_id": case.get("case_id"),
             "patient_index": case.get("patient_index"),
@@ -795,8 +792,6 @@ def export_case_excel(out_path: Path, case: Dict[str, Any]) -> Path:
         summary.to_excel(w, index=False, sheet_name="summary")
 
         tf = pd.DataFrame(case.get("top_features_agg", []))
-        if len(tf) == 0:
-            tf = pd.DataFrame(case.get("top_features", []))
         tf.to_excel(w, index=False, sheet_name="top_features_agg")
 
         tft = pd.DataFrame(case.get("top_features_at_time", []))
@@ -804,16 +799,15 @@ def export_case_excel(out_path: Path, case: Dict[str, Any]) -> Path:
 
         sim = pd.DataFrame(case.get("similar_patients", []))
         sim.to_excel(w, index=False, sheet_name="similar_patients")
+    return bio.getvalue()
 
-    return out_path
-
-def export_case_pdf(out_path: Path, case: Dict[str, Any], images: Optional[Dict[str, str]] = None) -> Path:
+def _case_pdf_bytes(case: Dict[str, Any], images: Optional[Dict[str, str]] = None) -> bytes:
     from reportlab.lib.pagesizes import A4
     from reportlab.pdfgen import canvas
     from reportlab.lib.units import cm
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    c = canvas.Canvas(str(out_path), pagesize=A4)
+    bio = io.BytesIO()
+    c = canvas.Canvas(bio, pagesize=A4)
     w, h = A4
 
     y = h - 2*cm
@@ -838,7 +832,6 @@ def export_case_pdf(out_path: Path, case: Dict[str, Any], images: Optional[Dict[
 
     y -= 0.4*cm
 
-    # Insert images if provided (heatmap, temporal plot)
     if images:
         for title, img_path in images.items():
             if y < 8*cm:
@@ -867,11 +860,17 @@ def export_case_pdf(out_path: Path, case: Dict[str, Any], images: Optional[Dict[
         y -= 0.7*cm
         c.setFont("Helvetica", 9)
         for r in rows[:max_rows]:
-            line = " | ".join([str(r.get(k)) for k in ["feat", "feature_en", "feature_ar"] if k in r])
-            if "score(abs)" in r:
-                line += f" | score={r.get('score(abs)')}"
+            parts = []
+            for k in ["feat", "feature_en", "feature_ar"]:
+                if k in r:
+                    parts.append(str(r.get(k)))
+            if "score(abs)_agg" in r:
+                parts.append(f"score={r.get('score(abs)_agg')}")
             if "value(norm)" in r:
-                line += f" | value={r.get('value(norm)')}"
+                parts.append(f"value={r.get('value(norm)')}")
+            if "abs_attr(time)" in r:
+                parts.append(f"abs_attr={r.get('abs_attr(time)')}")
+            line = " | ".join(parts)
             c.drawString(2*cm, y, line[:120])
             y -= 0.45*cm
             if y < 2*cm:
@@ -901,7 +900,7 @@ def export_case_pdf(out_path: Path, case: Dict[str, Any], images: Optional[Dict[
                 c.setFont("Helvetica", 10)
 
     c.save()
-    return out_path
+    return bio.getvalue()
 
 
 # -------------------- UI helpers --------------------
@@ -925,7 +924,6 @@ def _feat_lookup(df_map: pd.DataFrame, i: int) -> Tuple[str, str, str]:
     return str(r["feat_name"]), str(r["feature_en"]), str(r["feature_ar"])
 
 def _cosine_sim_matrix(A: np.ndarray, b: np.ndarray) -> np.ndarray:
-    # A: [N,H], b: [H]
     eps = 1e-9
     An = A / (np.linalg.norm(A, axis=1, keepdims=True) + eps)
     bn = b / (np.linalg.norm(b) + eps)
@@ -958,11 +956,9 @@ def _plot_line(y: np.ndarray, title: str, xlab: str, ylab: str):
 # -------------------- Streamlit UI --------------------
 def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_dir: Path = Path("cases")):
     import streamlit as st
-    import matplotlib.pyplot as plt
 
     st.set_page_config(page_title="Early Warning System", layout="wide")
     st.title("نظام الإنذار المبكر  |  Early Warning System")
-    st.caption("التفسير: Attention (Weak-XAI) + Integrated Gradients / GradientShap (Captum) بدون إعادة تدريب.")
 
     d = np.load(prepared_npz, allow_pickle=True)
     V, M, L, y = d["V"], d["M"], d["L"], d["y"]
@@ -979,7 +975,6 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
     # Cache embeddings for similarity search (computed once per session)
     @st.cache_data(show_spinner=True)
     def compute_all_embeddings(_prepared_path: str, _model_path: str) -> np.ndarray:
-        # Use model.encode_context to compute [N,H]
         VV = torch.from_numpy(V).to(device)
         MM = torch.from_numpy(M).to(device)
         LL = torch.from_numpy(L).to(device)
@@ -1010,7 +1005,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
 
         colb1, colb2 = st.sidebar.columns(2)
         run_explain = colb1.button(f"Explain ({'IG' if explain_method=='IntegratedGradients' else 'GradientShap'})")
-        save_this = colb2.button("Save case")
+        save_this = colb2.button("Save case (basic)")
     else:
         thr = st.sidebar.slider("Decision Threshold", 0.1, 0.9, float(threshold), 0.05)
         files = list_cases(cases_dir)
@@ -1022,8 +1017,8 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
         case = load_case(choices[picked])
         idx = int(case.get("patient_index", 0))
         explain_method = case.get("explain_method", "IntegratedGradients")
-        topk = 15
-        n_sim = 8
+        topk = int(case.get("topk", 15)) if isinstance(case.get("topk", 15), (int, float)) else 15
+        n_sim = int(case.get("n_sim", 8)) if isinstance(case.get("n_sim", 8), (int, float)) else 8
         run_explain = False
         save_this = False
 
@@ -1035,9 +1030,8 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
     Lt = torch.from_numpy(L[idx:idx+1]).to(device)
 
     with torch.no_grad():
-        logit, alpha = model(Vt, Mt, Lt)
+        logit, _ = model(Vt, Mt, Lt)
         risk = float(torch.sigmoid(logit).cpu().numpy()[0])
-        alpha = alpha.cpu().numpy()[0, :int(L[idx])]
 
     decision = "HIGH" if risk >= thr else "LOW"
 
@@ -1047,35 +1041,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
     c3.metric("Label", int(y[idx]))
     c4.metric("Time length", int(L[idx]))
 
-    # Weak-XAI Attention
-    st.subheader("Weak-XAI: Attention over time")
-    fig_att = _plot_line(alpha, "Attention over time", "Time step", "Attention")
-    st.pyplot(fig_att)
-
-    # Weak-XAI Top time step by attention + top observed features at that time
-    st.subheader("Weak-XAI: Top time step (attention) + top observed features at that time")
-    t_star_att = int(np.argmax(alpha))
-    obs_att = M[idx, t_star_att] > 0.5
-    vals_att = V[idx, t_star_att]
-    scores_att = np.abs(vals_att) * obs_att
-    top_att = np.argsort(-scores_att)[:topk]
-
-    rows_att = []
-    for fi in top_att:
-        feat_name, en, ar = _feat_lookup(fmap, int(fi))
-        rows_att.append({
-            "feat": feat_name,
-            "feature_en": en,
-            "feature_ar": ar,
-            "abs_value(norm)": float(scores_att[int(fi)]),
-            "value(norm)": float(vals_att[int(fi)]),
-            "observed": int(obs_att[int(fi)]),
-            "time_step(attention)": t_star_att
-        })
-    st.dataframe(pd.DataFrame(rows_att), use_container_width=True)
-
-    # Attribution explanations
-    st.subheader("Attribution-based explanation (IG / GradientShap)")
+    st.subheader("Explain (Captum)")
     st.caption("بعد الضغط على Explain سيتم عرض: Heatmap + Top features (مجمّع عبر الزمن) + Top time step + Top features at that time + Similar patients + Exports.")
 
     exp = None
@@ -1091,10 +1057,10 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
                     exp = explain_gradshap(model, V, M, L, idx=idx, n_samples=50, stdevs=0.01, topk=topk)
 
     if exp is None or "attr_full" not in exp:
-        st.info("اضغط Explain لعرض Heatmap + Top features + Similar patients.")
+        st.info("اضغط Explain لعرض Heatmap + Top features + Top timestep + Similar patients + Exports.")
     else:
         Tlen = int(L[idx])
-        attr_full = exp["attr_full"][:Tlen]  # [T,F]
+        attr_full = np.array(exp["attr_full"], dtype=np.float32)[:Tlen]  # [T,F]
         feat_imp = np.sum(np.abs(attr_full), axis=0)  # [F]
         time_imp = np.sum(np.abs(attr_full), axis=1)  # [T]
 
@@ -1112,15 +1078,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
                 "score(abs)_agg": float(feat_imp[int(fi)]),
             })
 
-        st.markdown(f"**Method:** {exp.get('method', explain_method)}")
-        st.markdown(f"**Top time step (by attribution):** {t_star}")
-
-        colx1, colx2 = st.columns(2)
-        with colx1:
-            st.markdown("**Top features (aggregated over time)**")
-            st.dataframe(pd.DataFrame(rows_agg), use_container_width=True)
-
-        # Top features at top time step (values at that time, and attribution at that time)
+        # Top features at top time step
         obs_t = (M[idx, t_star] > 0.5)
         vals_t = V[idx, t_star]
         attr_t = attr_full[t_star]  # [F]
@@ -1138,35 +1096,41 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
                 "time_step": t_star,
             })
 
+        st.markdown(f"**Method:** {exp.get('method', explain_method)}")
+        st.markdown(f"**Top time step (by attribution):** {t_star}")
+
+        colx1, colx2 = st.columns(2)
+        with colx1:
+            st.markdown("**Top features (aggregated over time)**")
+            st.dataframe(pd.DataFrame(rows_agg), use_container_width=True)
+
         with colx2:
             st.markdown("**Top features at Top time step**")
             st.dataframe(pd.DataFrame(rows_time), use_container_width=True)
 
         # Heatmap (Time x Features) for topk features
         st.markdown("### Heatmap (Time × Features)")
-        topk_feat = top_feat
-        mat = attr_full[:, topk_feat]  # [T,K]
         xt = []
-        for fi in topk_feat:
+        for fi in top_feat:
             _, en, _ = _feat_lookup(fmap, int(fi))
             xt.append(en)
-        fig_hm = _plot_heatmap(mat, "Attribution Heatmap (Time x Top Features)", "Top features", "Time step", xticklabels=None)
-        st.pyplot(fig_hm)
+        mat = attr_full[:, top_feat]  # [T,K]
+        fig_hm = _plot_heatmap(mat, "Attribution Heatmap (Time × Top Features)", "Top features", "Time step", xticklabels=xt)
+        st.pyplot(fig_hm, clear_figure=False)
 
         # Temporal importance plot
         st.markdown("### Top timestep + temporal importance")
-        fig_time = _plot_line(time_imp, "Temporal importance (sum abs attr)", "Time step", "Importance")
-        st.pyplot(fig_time)
+        fig_time = _plot_line(time_imp, "Temporal importance (sum abs attribution)", "Time step", "Importance")
+        st.pyplot(fig_time, clear_figure=False)
 
         # Similar patients (no training)
-        st.markdown("### Compare with similar patients (no retraining)")
+        st.markdown("### Similar patients (no retraining)")
         with st.spinner("Finding similar patients..."):
             b = all_emb[idx]  # [H]
             sims = _cosine_sim_matrix(all_emb, b)  # [N]
             sims[idx] = -1.0  # exclude itself
             top_sim_idx = np.argsort(-sims)[:int(n_sim)]
 
-            # compute their risk quickly (batch)
             Vs = torch.from_numpy(V[top_sim_idx]).to(device)
             Ms = torch.from_numpy(M[top_sim_idx]).to(device)
             Ls = torch.from_numpy(L[top_sim_idx]).to(device)
@@ -1185,7 +1149,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
                 })
         st.dataframe(pd.DataFrame(rows_sim), use_container_width=True)
 
-        # Build payload for saving + exports
+        # Build payload (full explain case)
         exp_payload = {
             "case_id": f"patient_{idx}_{time.strftime('%Y%m%d_%H%M%S')}",
             "patient_index": int(idx),
@@ -1196,57 +1160,62 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
             "time_len": int(Tlen),
             "explain_method": exp.get("method", explain_method),
             "top_time": int(t_star),
+            "topk": int(topk),
+            "n_sim": int(n_sim),
             "top_features_agg": rows_agg,
             "top_features_at_time": rows_time,
             "similar_patients": rows_sim,
-            # store heatmap only (top features) to keep JSON smaller
-            "attr_topk_heatmap": mat.tolist(),
-            "top_feat_idx": [int(x) for x in topk_feat.tolist()],
+            "attr_full": attr_full.tolist(),  # keep for re-open in Saved case
         }
 
-        # Exports (CSV/Excel/PDF)
-        st.markdown("### Exports (CSV / Excel / PDF) for this case")
-        cexp1, cexp2, cexp3, cexp4 = st.columns(4)
+        st.markdown("### Exports")
+        col_e1, col_e2, col_e3, col_e4 = st.columns(4)
 
-        if cexp1.button("Save case (JSON)"):
+        # Save JSON (server-side) optional
+        if col_e1.button("Save case (JSON)"):
             pth = save_case(cases_dir, exp_payload)
             st.success(f"Saved: {pth}")
 
-        if cexp2.button("Export CSV (summary)"):
-            out_csv = cases_dir / "exports" / f"{exp_payload['case_id']}.csv"
-            export_case_csv(out_csv, exp_payload)
-            st.success(f"Saved: {out_csv}")
+        # Download buttons (client-side)
+        csv_bytes = _case_csv_bytes(exp_payload)
+        col_e2.download_button(
+            label="Download CSV",
+            data=csv_bytes,
+            file_name=f"{exp_payload['case_id']}.csv",
+            mime="text/csv",
+        )
 
-        if cexp3.button("Export Excel (multi-sheet)"):
-            out_xlsx = cases_dir / "exports" / f"{exp_payload['case_id']}.xlsx"
-            export_case_excel(out_xlsx, exp_payload)
-            st.success(f"Saved: {out_xlsx}")
+        xlsx_bytes = _case_excel_bytes(exp_payload)
+        col_e3.download_button(
+            label="Download Excel",
+            data=xlsx_bytes,
+            file_name=f"{exp_payload['case_id']}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-        if cexp4.button("Export PDF report"):
-            # Save figures to temporary images then insert into PDF
-            tmpdir = Path(tempfile.mkdtemp())
-            hm_png = tmpdir / "heatmap.png"
-            time_png = tmpdir / "temporal.png"
-            att_png = tmpdir / "attention.png"
+        # PDF needs figures as temp images then embed
+        tmpdir = Path(tempfile.mkdtemp())
+        hm_png = tmpdir / "heatmap.png"
+        time_png = tmpdir / "temporal.png"
+        try:
+            fig_hm.savefig(hm_png, dpi=160, bbox_inches="tight")
+            fig_time.savefig(time_png, dpi=160, bbox_inches="tight")
+        except Exception:
+            pass
 
-            try:
-                fig_hm.savefig(hm_png, dpi=160, bbox_inches="tight")
-                fig_time.savefig(time_png, dpi=160, bbox_inches="tight")
-                fig_att.savefig(att_png, dpi=160, bbox_inches="tight")
-            except Exception:
-                pass
-
-            out_pdf = cases_dir / "exports" / f"{exp_payload['case_id']}.pdf"
-            export_case_pdf(
-                out_pdf,
-                exp_payload,
-                images={
-                    "Attention over time": str(att_png),
-                    "Attribution heatmap (Time x Features)": str(hm_png),
-                    "Temporal importance": str(time_png),
-                }
-            )
-            st.success(f"Saved: {out_pdf}")
+        pdf_bytes = _case_pdf_bytes(
+            exp_payload,
+            images={
+                "Attribution heatmap (Time × Features)": str(hm_png),
+                "Temporal importance": str(time_png),
+            }
+        )
+        col_e4.download_button(
+            label="Download PDF",
+            data=pdf_bytes,
+            file_name=f"{exp_payload['case_id']}.pdf",
+            mime="application/pdf",
+        )
 
     # Save basic case even without explanation
     if mode == "Dataset patient" and save_this:
@@ -1257,7 +1226,6 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
             "threshold": _safe_float(thr),
             "decision": decision,
             "label": int(y[idx]),
-            "top_time_attention": int(t_star_att),
             "explain_method": explain_method,
             "notes": "",
         }
