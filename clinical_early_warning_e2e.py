@@ -1266,7 +1266,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
         st.success(f"Saved: {pth}")
 
     st.divider()
-    st.subheader("Offline usage / التشغيل بدون تدريب أو تحميل")
+    st.subheader("Offline usage / التشغيل بدون تحميل أو تشغيل")
     st.markdown(
         "- احفظ الملفات: **prepared_dataset.npz** و **best_model.pt**\n"
         "- شغّل فقط الواجهة:\n"
