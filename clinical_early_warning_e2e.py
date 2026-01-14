@@ -962,7 +962,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
 
     st.set_page_config(page_title="Early Warning System", layout="wide")
     st.title("نظام الإنذار المبكر  |  Early Warning System")
-    st.caption("التفسير: Attention (Weak-XAI) + Integrated Gradients / GradientShap (Captum) بدون إعادة تدريب.")
+    st.caption(" Attention (Weak-XAI) & Integrated Gradients / GradientShap ")
 
     d = np.load(prepared_npz, allow_pickle=True)
     V, M, L, y = d["V"], d["M"], d["L"], d["y"]
@@ -1053,7 +1053,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
     st.pyplot(fig_att)
 
     # Weak-XAI Top time step by attention + top observed features at that time
-    st.subheader("Weak-XAI: Top time step (attention) + top observed features at that time")
+    st.subheader("Weak-XAI: Top time step & top observed features at that time")
     t_star_att = int(np.argmax(alpha))
     obs_att = M[idx, t_star_att] > 0.5
     vals_att = V[idx, t_star_att]
@@ -1076,7 +1076,7 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
 
     # Attribution explanations
     st.subheader("Attribution-based explanation (IG / GradientShap)")
-    st.caption("بعد الضغط على Explain سيتم عرض: Heatmap + Top features (مجمّع عبر الزمن) + Top time step + Top features at that time + Similar patients + Exports.")
+    st.caption(" Explain : Heatmap & Top features  & Top time step & Top features at that time & Similar patients & Exports.")
 
     exp = None
     if mode == "Saved case":
@@ -1268,9 +1268,9 @@ def run_ui(prepared_npz: Path, model_path: Path, threshold: float = 0.6, cases_d
     st.subheader("Offline usage / التشغيل بدون تحميل أو تشغيل")
     st.markdown(
         "- احفظ الملفات: **prepared_dataset.npz** و **best_model.pt**\n"
-        "- شغّل فقط الواجهة:\n"
+        "- شغّل ON :\n"
         "  - `streamlit run clinical_early_warning_e2e.py -- ui --prepared <path>/prepared_dataset.npz --model <path>/best_model.pt`\n"
-        "- التطبيق يحتاج عملية Streamlit تعمل (محليًا أو سيرفر)."
+        "- ا Streamlit "
     )
 
 
